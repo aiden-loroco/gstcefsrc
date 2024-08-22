@@ -1,4 +1,7 @@
 #include <cstdio>
+#include <sstream>
+#include <string>
+
 #ifdef __APPLE__
 #include <memory>
 #include <string>
@@ -38,24 +41,29 @@ GST_DEBUG_CATEGORY_STATIC (cef_console_debug);
 #else
 #define DEFAULT_SANDBOX FALSE
 #endif
+#define DEFAULT_LISTEN_FOR_JS_SIGNALS FALSE
 
 using CefStatus = enum : guint8 {
   // CEF was either unloaded successfully or not yet loaded.
   CEF_STATUS_NOT_LOADED = 0U,
   // Blocks other elements from initializing CEF is it's already in progress.
   CEF_STATUS_INITIALIZING = 1U,
+  // waiting for CEF browser to send "ready" message (using window.gstSendMsg)
+  CEF_STATUS_WAITING_FOR_READY_SIGNAL = 1U << 2U,
   // CEF's initialization process has completed successfully.
-  CEF_STATUS_INITIALIZED = 1U << 2U,
+  CEF_STATUS_INITIALIZED = 1U << 3U,
   // No CEF elements will be allowed to complete initialization.
-  CEF_STATUS_FAILURE = 1U << 3U,
+  CEF_STATUS_FAILURE = 1U << 4U,
   // CEF has been marked for shutdown, stopping any leftover events from being
   // processed. Any elements that need it must wait till this flag and
   // cef_initializing are cleared.
-  CEF_STATUS_SHUTTING_DOWN = 1U << 4U,
+  CEF_STATUS_SHUTTING_DOWN = 1U << 5U,
 };
 static CefStatus cef_status = CEF_STATUS_NOT_LOADED;
-static const guint8 CEF_STATUS_MASK_INITIALIZED = CEF_STATUS_FAILURE | CEF_STATUS_INITIALIZED;
-static const guint8 CEF_STATUS_MASK_TRANSITIONING = CEF_STATUS_SHUTTING_DOWN | CEF_STATUS_INITIALIZING;
+static const guint8 CEF_STATUS_MASK_INITIALIZED =
+  CEF_STATUS_FAILURE | CEF_STATUS_INITIALIZED | CEF_STATUS_WAITING_FOR_READY_SIGNAL;
+static const guint8 CEF_STATUS_MASK_TRANSITIONING =
+  CEF_STATUS_SHUTTING_DOWN | CEF_STATUS_INITIALIZING;
 
 // Number of running CEF instances. Setting this to 0 must be accompanied
 // with cef_shutdown to prevent leaks on application exit.
@@ -103,6 +111,7 @@ enum
   PROP_CHROMIUM_DEBUG_PORT,
   PROP_CHROME_EXTRA_FLAGS,
   PROP_SANDBOX,
+  PROP_LISTEN_FOR_JS_SIGNAL,
   PROP_JS_FLAGS,
   PROP_LOG_SEVERITY,
   PROP_CEF_CACHE_LOCATION,
@@ -133,31 +142,72 @@ gchar* get_plugin_base_path () {
 
 /** Handlers */
 
+// see https://bitbucket.org/chromiumembedded/cef-project/src/master/examples/message_router
+// and https://bitbucket.org/chromiumembedded/cef/src/master/include/wrapper/cef_message_router.h
+// for details of the message passing infrastructure in CEF
 // Handle messages in the browser process.
 class MessageHandler : public CefMessageRouterBrowserSide::Handler {
  public:
-  explicit MessageHandler(const CefString& startup_url)
-      : startup_url_(startup_url) {}
+  explicit MessageHandler(const GstCefSrc* src)
+      : src(src) {}
 
-  // Called due to cefQuery execution in message_router.html.
+  // Called due to gstSendMsg execution in ready_test.html.
   bool OnQuery(CefRefPtr<CefBrowser> browser,
                CefRefPtr<CefFrame> frame,
                int64_t query_id,
                const CefString& request,
                bool persistent,
-               CefRefPtr<Callback> callback) override {
-    // Only handle messages from the startup URL.
-    const std::string& url = frame->GetURL();
-    if (url.find(startup_url_) != 0)
-      return false;
+               CefRefPtr<Callback> callback) override
+  {
+    if (!src) return false;
 
-    const std::string& message_name = request;
-    callback->Success(message_name + " is working");
+    // TODO: do we want to make the incoming payload json??
+    bool success = false;
+    std::ostringstream error_msg;
+    error_msg << "error: (" << request << ") - ";
+    if (request == "ready") {
+      g_mutex_lock (&init_lock);
+      if (cef_status == CEF_STATUS_WAITING_FOR_READY_SIGNAL) {
+        cef_status = CEF_STATUS_INITIALIZED;
+        g_cond_broadcast (&init_cond);
+        success = true;
+      } else {
+        error_msg << "js ready signal sent with invalid cef state: " << cef_status;
+        GST_WARNING_OBJECT(src, "%s", error_msg.str().c_str());
+        success = false;
+      }
+      g_mutex_unlock (&init_lock);
+    } else if (request == "eos") {
+      if (src) {
+        gst_element_send_event(GST_ELEMENT(src), gst_event_new_eos());
+        success = true;
+      }
+    }
+
+    // send json response back to js
+    std::ostringstream response;
+    response <<
+      "{ " <<
+        "\"success\": \"" << (success ? "true" : "false") << "\", " <<
+        "\"cmd\": \"" << request << "\"" <<
+      " }";
+    if (success) {
+      GST_INFO_OBJECT(
+        src, "js signal processed successfully: %s", request.ToString().c_str()
+      );
+      callback->Success(response.str());
+    } else {
+      GST_WARNING_OBJECT(
+        src, "js signal processing error: %s", request.ToString().c_str()
+      );
+      callback->Failure(0, response.str());
+    }
+
     return true;
   }
 
  private:
-  const CefString startup_url_;
+  const GstCefSrc* src;
 
   DISALLOW_COPY_AND_ASSIGN(MessageHandler);
 };
@@ -379,12 +429,14 @@ class BrowserClient :
     {
       CEF_REQUIRE_UI_THREAD();
 
-      return browser_msg_router_->OnProcessMessageReceived(
-        browser,
-        frame,
-        source_process,
-        message
-      );
+      return browser_msg_router_
+        ? browser_msg_router_->OnProcessMessageReceived(
+          browser,
+          frame,
+          source_process,
+          message
+        )
+        : false;
     }
 
     // CefLifeSpanHandler Methods:
@@ -392,7 +444,7 @@ class BrowserClient :
     {
       CEF_REQUIRE_UI_THREAD();
 
-      if (!browser_msg_router_) {
+      if (src->listen_for_js_signals && !browser_msg_router_) {
         // Create the browser-side router for query handling.
         CefMessageRouterConfig config;
         config.js_query_function = "gstSendMsg";
@@ -400,7 +452,7 @@ class BrowserClient :
         browser_msg_router_ = CefMessageRouterBrowserSide::Create(config);
 
         // Register handlers with the router.
-        browser_msg_handler_.reset(new MessageHandler(src->url));
+        browser_msg_handler_.reset(new MessageHandler(src));
         browser_msg_router_->AddHandler(browser_msg_handler_.get(), false);
       }
     }
@@ -432,7 +484,7 @@ class BrowserClient :
     {
       CEF_REQUIRE_UI_THREAD();
 
-      browser_msg_router_->OnBeforeBrowse(browser, frame);
+      if (browser_msg_router_) browser_msg_router_->OnBeforeBrowse(browser, frame);
       return false;
     }
 
@@ -440,7 +492,7 @@ class BrowserClient :
     {
       CEF_REQUIRE_UI_THREAD();
       GST_WARNING_OBJECT (src, "Render subprocess terminated, reloading URL!");
-      browser_msg_router_->OnRenderProcessTerminated(browser);
+      if (browser_msg_router_) browser_msg_router_->OnRenderProcessTerminated(browser);
       browser->Reload();
     }
 
@@ -744,10 +796,11 @@ run_cef (GstCefSrc *src)
   }
 
   g_mutex_lock (&init_lock);
-  cef_status = CEF_STATUS_INITIALIZED;
+  cef_status = src->listen_for_js_signals
+    ? CEF_STATUS_WAITING_FOR_READY_SIGNAL
+    : CEF_STATUS_INITIALIZED;
   g_cond_broadcast (&init_cond);
   g_mutex_unlock (&init_lock);
-
 #ifndef __APPLE__
   CefRunMessageLoop();
   gst_cef_shutdown(nullptr);
@@ -793,7 +846,7 @@ gst_cef_src_change_state(GstElement *src, GstStateChange transition)
       while (cef_status == CEF_STATUS_INITIALIZING)
         g_cond_wait (&init_cond, &init_lock);
 #endif
-      if (cef_status != CEF_STATUS_INITIALIZED) {
+      if (cef_status & ~CEF_STATUS_MASK_INITIALIZED) {
         // BAIL OUT, CEF is not loaded.
         result = GST_STATE_CHANGE_FAILURE;
 #ifndef __APPLE__
@@ -882,6 +935,13 @@ gst_cef_src_start(GstBaseSrc *base_src)
 #ifdef __APPLE__
   }
 #endif
+
+  if (src->listen_for_js_signals) {
+    g_mutex_lock (&init_lock);
+    while (cef_status == CEF_STATUS_WAITING_FOR_READY_SIGNAL)
+      g_cond_wait (&init_cond, &init_lock);
+    g_mutex_unlock (&init_lock);
+  }
 
   ret = src->browser != NULL;
 
@@ -1050,6 +1110,11 @@ gst_cef_src_set_property (GObject * object, guint prop_id, const GValue * value,
       src->sandbox = g_value_get_boolean (value);
       break;
     }
+    case PROP_LISTEN_FOR_JS_SIGNAL:
+    {
+      src->listen_for_js_signals = g_value_get_boolean (value);
+      break;
+    }
     case PROP_JS_FLAGS: {
       g_free (src->js_flags);
       src->js_flags = g_value_dup_string (value);
@@ -1091,6 +1156,9 @@ gst_cef_src_get_property (GObject * object, guint prop_id, GValue * value,
       break;
     case PROP_SANDBOX:
       g_value_set_boolean (value, src->sandbox);
+      break;
+    case PROP_LISTEN_FOR_JS_SIGNAL:
+      g_value_set_boolean (value, src->listen_for_js_signals);
       break;
     case PROP_JS_FLAGS:
       g_value_set_string (value, src->js_flags);
@@ -1139,6 +1207,7 @@ gst_cef_src_init (GstCefSrc * src)
   src->started = FALSE;
   src->chromium_debug_port = DEFAULT_CHROMIUM_DEBUG_PORT;
   src->sandbox = DEFAULT_SANDBOX;
+  src->listen_for_js_signals = DEFAULT_LISTEN_FOR_JS_SIGNALS;
   src->js_flags = NULL;
   src->log_severity = DEFAULT_LOG_SEVERITY;
   src->cef_cache_location = NULL;
@@ -1188,6 +1257,10 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
     g_param_spec_boolean ("sandbox", "sandbox",
           "Toggle chromium sandboxing capabilities",
           DEFAULT_SANDBOX, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
+  g_object_class_install_property (gobject_class, PROP_LISTEN_FOR_JS_SIGNAL,
+    g_param_spec_boolean ("listen-for-js-signals", "listen-for-js-signals",
+          "Listen and respond to signals sent from javascript: window.gstSendMsg({request: \"ready|eos\", ...})",
+          DEFAULT_LISTEN_FOR_JS_SIGNALS, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
 
   g_object_class_install_property (gobject_class, PROP_JS_FLAGS,
     g_param_spec_string ("js-flags", "js-flags",

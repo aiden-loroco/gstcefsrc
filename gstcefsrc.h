@@ -44,6 +44,7 @@ struct _GstCefSrc {
   gchar *cef_cache_location;
   gboolean gpu;
   gboolean sandbox;
+  gboolean listen_for_js_signals;
   gint chromium_debug_port;
   CefRefPtr<CefBrowser> browser;
   CefRefPtr<CefApp> app;
