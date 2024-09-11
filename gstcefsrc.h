@@ -44,6 +44,7 @@ struct _GstCefSrc {
   gchar *cef_cache_location;
   gboolean gpu;
   gboolean sandbox;
+  gboolean listen_for_js_signals;
   gint chromium_debug_port;
   CefRefPtr<CefBrowser> browser;
   CefRefPtr<CefApp> app;
@@ -57,9 +58,9 @@ struct _GstCefSrcClass {
   GstPushSrcClass parent_class;
 };
 
-class App : public CefApp, public CefBrowserProcessHandler {
+class BrowserApp : public CefApp, public CefBrowserProcessHandler {
 public:
-  App(GstCefSrc *src);
+  BrowserApp(GstCefSrc *src);
 
   void OnBeforeCommandLineProcessing(const CefString &process_type,
                                      CefRefPtr<CefCommandLine> command_line) override;
@@ -69,7 +70,8 @@ public:
   void OnScheduleMessagePumpWork(int64_t delay_ms) override;
 #endif
 private:
-  IMPLEMENT_REFCOUNTING(App);
+  IMPLEMENT_REFCOUNTING(BrowserApp);
+  DISALLOW_COPY_AND_ASSIGN(BrowserApp);
   GstCefSrc *src;
 };
 

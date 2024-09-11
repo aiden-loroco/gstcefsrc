@@ -1,4 +1,7 @@
 #include <cstdio>
+#include <sstream>
+#include <string>
+
 #ifdef __APPLE__
 #include <memory>
 #include <string>
@@ -11,6 +14,7 @@
 #include <include/base/cef_bind.h>
 #include <include/base/cef_callback_helpers.h>
 #include <include/wrapper/cef_closure_task.h>
+#include <include/wrapper/cef_message_router.h>
 
 #include "gstcefsrc.h"
 #include "gstcefaudiometa.h"
@@ -37,24 +41,29 @@ GST_DEBUG_CATEGORY_STATIC (cef_console_debug);
 #else
 #define DEFAULT_SANDBOX FALSE
 #endif
+#define DEFAULT_LISTEN_FOR_JS_SIGNALS FALSE
 
 using CefStatus = enum : guint8 {
   // CEF was either unloaded successfully or not yet loaded.
   CEF_STATUS_NOT_LOADED = 0U,
   // Blocks other elements from initializing CEF is it's already in progress.
   CEF_STATUS_INITIALIZING = 1U,
+  // waiting for CEF browser to send "ready" message (using window.gstSendMsg)
+  CEF_STATUS_WAITING_FOR_READY_SIGNAL = 1U << 2U,
   // CEF's initialization process has completed successfully.
-  CEF_STATUS_INITIALIZED = 1U << 2U,
+  CEF_STATUS_INITIALIZED = 1U << 3U,
   // No CEF elements will be allowed to complete initialization.
-  CEF_STATUS_FAILURE = 1U << 3U,
+  CEF_STATUS_FAILURE = 1U << 4U,
   // CEF has been marked for shutdown, stopping any leftover events from being
   // processed. Any elements that need it must wait till this flag and
   // cef_initializing are cleared.
-  CEF_STATUS_SHUTTING_DOWN = 1U << 4U,
+  CEF_STATUS_SHUTTING_DOWN = 1U << 5U,
 };
 static CefStatus cef_status = CEF_STATUS_NOT_LOADED;
-static const guint8 CEF_STATUS_MASK_INITIALIZED = CEF_STATUS_FAILURE | CEF_STATUS_INITIALIZED;
-static const guint8 CEF_STATUS_MASK_TRANSITIONING = CEF_STATUS_SHUTTING_DOWN | CEF_STATUS_INITIALIZING;
+static const guint8 CEF_STATUS_MASK_INITIALIZED =
+  CEF_STATUS_FAILURE | CEF_STATUS_INITIALIZED | CEF_STATUS_WAITING_FOR_READY_SIGNAL;
+static const guint8 CEF_STATUS_MASK_TRANSITIONING =
+  CEF_STATUS_SHUTTING_DOWN | CEF_STATUS_INITIALIZING;
 
 // Number of running CEF instances. Setting this to 0 must be accompanied
 // with cef_shutdown to prevent leaks on application exit.
@@ -102,6 +111,7 @@ enum
   PROP_CHROMIUM_DEBUG_PORT,
   PROP_CHROME_EXTRA_FLAGS,
   PROP_SANDBOX,
+  PROP_LISTEN_FOR_JS_SIGNAL,
   PROP_JS_FLAGS,
   PROP_LOG_SEVERITY,
   PROP_CEF_CACHE_LOCATION,
@@ -127,12 +137,87 @@ gchar* get_plugin_base_path () {
   return base_path;
 }
 
+
+/** Cef Client */
+
+/** Handlers */
+
+// see https://bitbucket.org/chromiumembedded/cef-project/src/master/examples/message_router
+// and https://bitbucket.org/chromiumembedded/cef/src/master/include/wrapper/cef_message_router.h
+// for details of the message passing infrastructure in CEF
+// Handle messages in the browser process.
+class MessageHandler : public CefMessageRouterBrowserSide::Handler {
+ public:
+  explicit MessageHandler(const GstCefSrc* src)
+      : src(src) {}
+
+  // Called due to gstSendMsg execution in ready_test.html.
+  bool OnQuery(CefRefPtr<CefBrowser> browser,
+               CefRefPtr<CefFrame> frame,
+               int64_t query_id,
+               const CefString& request,
+               bool persistent,
+               CefRefPtr<Callback> callback) override
+  {
+    if (!src) return false;
+
+    // TODO: do we want to make the incoming payload json??
+    bool success = false;
+    std::ostringstream error_msg;
+    error_msg << "error: (" << request << ") - ";
+    if (request == "ready") {
+      g_mutex_lock (&init_lock);
+      if (cef_status == CEF_STATUS_WAITING_FOR_READY_SIGNAL) {
+        cef_status = CEF_STATUS_INITIALIZED;
+        g_cond_broadcast (&init_cond);
+        success = true;
+      } else {
+        error_msg << "js ready signal sent with invalid cef state: " << cef_status;
+        GST_WARNING_OBJECT(src, "%s", error_msg.str().c_str());
+        success = false;
+      }
+      g_mutex_unlock (&init_lock);
+    } else if (request == "eos") {
+      if (src) {
+        gst_element_send_event(GST_ELEMENT(src), gst_event_new_eos());
+        success = true;
+      }
+    }
+
+    // send json response back to js
+    std::ostringstream response;
+    response <<
+      "{ " <<
+        "\"success\": \"" << (success ? "true" : "false") << "\", " <<
+        "\"cmd\": \"" << request << "\"" <<
+      " }";
+    if (success) {
+      GST_INFO_OBJECT(
+        src, "js signal processed successfully: %s", request.ToString().c_str()
+      );
+      callback->Success(response.str());
+    } else {
+      GST_WARNING_OBJECT(
+        src, "js signal processing error: %s", request.ToString().c_str()
+      );
+      callback->Failure(0, response.str());
+    }
+
+    return true;
+  }
+
+ private:
+  const GstCefSrc* src;
+
+  DISALLOW_COPY_AND_ASSIGN(MessageHandler);
+};
+
 class RenderHandler : public CefRenderHandler
 {
   public:
 
-    RenderHandler(GstCefSrc *element) :
-        element (element)
+    RenderHandler(GstCefSrc *src) :
+        src (src)
     {
     }
 
@@ -142,68 +227,42 @@ class RenderHandler : public CefRenderHandler
 
     void GetViewRect(CefRefPtr<CefBrowser> browser, CefRect &rect) override
     {
-	  GST_LOG_OBJECT(element, "getting view rect");
-      GST_OBJECT_LOCK (element);
-      rect = CefRect(0, 0, element->vinfo.width ? element->vinfo.width : DEFAULT_WIDTH, element->vinfo.height ? element->vinfo.height : DEFAULT_HEIGHT);
-      GST_OBJECT_UNLOCK (element);
+	  GST_LOG_OBJECT(src, "getting view rect");
+      GST_OBJECT_LOCK (src);
+      rect = CefRect(0, 0, src->vinfo.width ? src->vinfo.width : DEFAULT_WIDTH, src->vinfo.height ? src->vinfo.height : DEFAULT_HEIGHT);
+      GST_OBJECT_UNLOCK (src);
     }
 
     void OnPaint(CefRefPtr<CefBrowser> browser, PaintElementType type, const RectList &dirtyRects, const void * buffer, int w, int h) override
     {
       GstBuffer *new_buffer;
 
-      GST_LOG_OBJECT (element, "painting, width / height: %d %d", w, h);
+      GST_LOG_OBJECT (src, "painting, width / height: %d %d", w, h);
 
-      new_buffer = gst_buffer_new_allocate (NULL, element->vinfo.width * element->vinfo.height * 4, NULL);
+      new_buffer = gst_buffer_new_allocate (NULL, src->vinfo.width * src->vinfo.height * 4, NULL);
       gst_buffer_fill (new_buffer, 0, buffer, w * h * 4);
 
-      GST_OBJECT_LOCK (element);
-      gst_buffer_replace (&(element->current_buffer), new_buffer);
+      GST_OBJECT_LOCK (src);
+      gst_buffer_replace (&(src->current_buffer), new_buffer);
       gst_buffer_unref (new_buffer);
-      GST_OBJECT_UNLOCK (element);
+      GST_OBJECT_UNLOCK (src);
 
-      GST_LOG_OBJECT (element, "done painting");
+      GST_LOG_OBJECT (src, "done painting");
     }
 
   private:
 
-    GstCefSrc *element;
+    GstCefSrc *src;
 
     IMPLEMENT_REFCOUNTING(RenderHandler);
 };
-
-class RequestHandler : public CefRequestHandler
-{
-  public:
-
-    RequestHandler(GstCefSrc *element) :
-        element (element)
-    {
-    }
-
-    ~RequestHandler()
-    {
-    }
-
-    virtual void OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser, TerminationStatus status) override
-		{
-			GST_WARNING_OBJECT (element, "Render subprocess terminated, reloading URL!");
-      browser->Reload();
-    }
-
-  private:
-
-    GstCefSrc *element;
-    IMPLEMENT_REFCOUNTING(RequestHandler);
-};
-
 
 class AudioHandler : public CefAudioHandler
 {
   public:
 
-    AudioHandler(GstCefSrc *element) :
-        mElement (element)
+    AudioHandler(GstCefSrc *src) :
+        src (src)
     {
     }
 
@@ -224,9 +283,9 @@ class AudioHandler : public CefAudioHandler
     mRate = params.sample_rate;
     mChannels = channels;
 
-    GST_OBJECT_LOCK (mElement);
-    mElement->audio_events = g_list_append (mElement->audio_events, event);
-    GST_OBJECT_UNLOCK (mElement);
+    GST_OBJECT_LOCK (src);
+    src->audio_events = g_list_append (src->audio_events, event);
+    GST_OBJECT_UNLOCK (src);
   }
 
   void OnAudioStreamPacket(CefRefPtr<CefBrowser> browser,
@@ -238,7 +297,7 @@ class AudioHandler : public CefAudioHandler
     GstMapInfo info;
     gint i, j;
 
-    GST_LOG_OBJECT (mElement, "Handling audio stream packet with %d frames", frames);
+    GST_LOG_OBJECT (src, "Handling audio stream packet with %d frames", frames);
 
     buf = gst_buffer_new_allocate (NULL, mChannels * frames * 4, NULL);
 
@@ -252,18 +311,18 @@ class AudioHandler : public CefAudioHandler
     }
     gst_buffer_unmap (buf, &info);
 
-    GST_OBJECT_LOCK (mElement);
+    GST_OBJECT_LOCK (src);
 
     GST_BUFFER_DURATION (buf) = gst_util_uint64_scale (frames, GST_SECOND, mRate);
 
-    if (!mElement->audio_buffers) {
-      mElement->audio_buffers = gst_buffer_list_new();
+    if (!src->audio_buffers) {
+      src->audio_buffers = gst_buffer_list_new();
     }
 
-    gst_buffer_list_add (mElement->audio_buffers, buf);
-    GST_OBJECT_UNLOCK (mElement);
+    gst_buffer_list_add (src->audio_buffers, buf);
+    GST_OBJECT_UNLOCK (src);
 
-    GST_LOG_OBJECT (mElement, "Handled audio stream packet");
+    GST_LOG_OBJECT (src, "Handled audio stream packet");
   }
 
   void OnAudioStreamStopped(CefRefPtr<CefBrowser> browser) override
@@ -272,12 +331,12 @@ class AudioHandler : public CefAudioHandler
 
   void OnAudioStreamError(CefRefPtr<CefBrowser> browser,
                           const CefString& message) override {
-    GST_WARNING_OBJECT (mElement, "Audio stream error: %s", message.ToString().c_str());
+    GST_WARNING_OBJECT (src, "Audio stream error: %s", message.ToString().c_str());
   }
 
   private:
 
-    GstCefSrc *mElement;
+    GstCefSrc *src;
     gint mRate;
     gint mChannels;
     IMPLEMENT_REFCOUNTING(AudioHandler);
@@ -285,7 +344,7 @@ class AudioHandler : public CefAudioHandler
 
 class DisplayHandler : public CefDisplayHandler {
 public:
-  DisplayHandler(GstCefSrc *element) : mElement(element) {}
+  DisplayHandler(GstCefSrc *src) : src(src) {}
 
   ~DisplayHandler() = default;
 
@@ -310,33 +369,35 @@ public:
       gst_level = GST_LEVEL_NONE;
       break;
     };
-    GST_CAT_LEVEL_LOG (cef_console_debug, gst_level, mElement, "%s:%d %s", source.ToString().c_str(), line,
+    GST_CAT_LEVEL_LOG (cef_console_debug, gst_level, src, "%s:%d %s", source.ToString().c_str(), line,
       message.ToString().c_str());
     return false;
   }
 
 private:
-  GstCefSrc *mElement;
+  GstCefSrc *src;
   IMPLEMENT_REFCOUNTING(DisplayHandler);
 };
 
 class BrowserClient :
   public CefClient,
-  public CefLifeSpanHandler
+  public CefLifeSpanHandler,
+  public CefRequestHandler
 {
   public:
 
-    BrowserClient(CefRefPtr<CefRenderHandler> rptr, CefRefPtr<CefAudioHandler> aptr, CefRefPtr<CefRequestHandler> rqptr, CefRefPtr<CefDisplayHandler> display_handler, GstCefSrc *element) :
-        render_handler(rptr),
-        audio_handler(aptr),
-        request_handler(rqptr),
-        display_handler(display_handler),
-        mElement(element)
+    BrowserClient(GstCefSrc *src) : src(src)
     {
+
+      this->render_handler = new RenderHandler(src);
+      this->audio_handler = new AudioHandler(src);
+      this->display_handler = new DisplayHandler(src);
     }
 
-    virtual CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override {
-        return this;
+    // CefClient Methods:
+    virtual CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override
+    {
+      return this;
     }
 
     virtual CefRefPtr<CefRenderHandler> GetRenderHandler() override
@@ -351,7 +412,7 @@ class BrowserClient :
 
     virtual CefRefPtr<CefRequestHandler> GetRequestHandler() override
     {
-      return request_handler;
+      return this;
     }
 
     virtual CefRefPtr<CefDisplayHandler> GetDisplayHandler() override
@@ -359,72 +420,143 @@ class BrowserClient :
       return display_handler;
     }
 
-    virtual void OnBeforeClose(CefRefPtr<CefBrowser> browser) override;
+    bool OnProcessMessageReceived(
+      CefRefPtr<CefBrowser> browser,
+      CefRefPtr<CefFrame> frame,
+      CefProcessId source_process,
+      CefRefPtr<CefProcessMessage> message
+    ) override
+    {
+      CEF_REQUIRE_UI_THREAD();
 
-    void MakeBrowser(int);
+      return browser_msg_router_
+        ? browser_msg_router_->OnProcessMessageReceived(
+          browser,
+          frame,
+          source_process,
+          message
+        )
+        : false;
+    }
+
+    // CefLifeSpanHandler Methods:
+    void OnAfterCreated(CefRefPtr<CefBrowser> browser) override
+    {
+      CEF_REQUIRE_UI_THREAD();
+
+      if (src->listen_for_js_signals && !browser_msg_router_) {
+        // Create the browser-side router for query handling.
+        CefMessageRouterConfig config;
+        config.js_query_function = "gstSendMsg";
+        config.js_cancel_function = "gstCancelMsg";
+        browser_msg_router_ = CefMessageRouterBrowserSide::Create(config);
+
+        // Register handlers with the router.
+        browser_msg_handler_.reset(new MessageHandler(src));
+        browser_msg_router_->AddHandler(browser_msg_handler_.get(), false);
+      }
+    }
+
+    virtual void OnBeforeClose(CefRefPtr<CefBrowser> browser) override
+    {
+      src->browser = nullptr;
+      g_mutex_lock (&src->state_lock);
+      src->started = FALSE;
+      g_cond_signal (&src->state_cond);
+      g_mutex_unlock(&src->state_lock);
+      g_mutex_lock(&init_lock);
+      g_assert (browsers > 0);
+      browsers -= 1;
+      if (browsers == 0) {
+        CefQuitMessageLoop();
+      }
+      g_mutex_unlock (&init_lock);
+    }
+
+    // CefRequestHandler methods:
+    bool OnBeforeBrowse(
+      CefRefPtr<CefBrowser> browser,
+      CefRefPtr<CefFrame> frame,
+      CefRefPtr<CefRequest> request,
+      bool user_gesture,
+      bool is_redirect
+    ) override
+    {
+      CEF_REQUIRE_UI_THREAD();
+
+      if (browser_msg_router_) browser_msg_router_->OnBeforeBrowse(browser, frame);
+      return false;
+    }
+
+    virtual void OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser, TerminationStatus status) override
+    {
+      CEF_REQUIRE_UI_THREAD();
+      GST_WARNING_OBJECT (src, "Render subprocess terminated, reloading URL!");
+      if (browser_msg_router_) browser_msg_router_->OnRenderProcessTerminated(browser);
+      browser->Reload();
+    }
+
+    // Custom methods:
+    void MakeBrowser(int)
+    {
+      CefWindowInfo window_info;
+      CefRefPtr<CefBrowser> browser;
+      CefBrowserSettings browser_settings;
+
+      window_info.SetAsWindowless(0);
+      browser = CefBrowserHost::CreateBrowserSync(
+        window_info,
+        this,
+        std::string(src->url),
+        browser_settings,
+        nullptr,
+        nullptr
+      );
+      g_mutex_lock (&init_lock);
+      g_assert (browsers < G_MAXUINT64);
+      browsers += 1;
+      g_mutex_unlock(&init_lock);
+
+      browser->GetHost()->SetAudioMuted(true);
+
+      src->browser = browser;
+
+      g_mutex_lock (&src->state_lock);
+      src->started = TRUE;
+      g_cond_signal (&src->state_cond);
+      g_mutex_unlock(&src->state_lock);
+    }
 
   private:
+    // Handles the browser side of query routing.
+    CefRefPtr<CefMessageRouterBrowserSide> browser_msg_router_;
+    std::unique_ptr<CefMessageRouterBrowserSide::Handler> browser_msg_handler_;
 
     CefRefPtr<CefRenderHandler> render_handler;
     CefRefPtr<CefAudioHandler> audio_handler;
-    CefRefPtr<CefRequestHandler> request_handler;
     CefRefPtr<CefDisplayHandler> display_handler;
 
   public:
-    GstCefSrc *mElement;
+    GstCefSrc *src;
 
     IMPLEMENT_REFCOUNTING(BrowserClient);
+    DISALLOW_COPY_AND_ASSIGN(BrowserClient);
 };
 
-void BrowserClient::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
-  mElement->browser = nullptr;
-  g_mutex_lock (&mElement->state_lock);
-  mElement->started = FALSE;
-  g_cond_signal (&mElement->state_cond);
-  g_mutex_unlock(&mElement->state_lock);
-  g_mutex_lock(&init_lock);
-  g_assert (browsers > 0);
-  browsers -= 1;
-  if (browsers == 0) {
-    CefQuitMessageLoop();
-  }
-  g_mutex_unlock (&init_lock);
-}
 
-void BrowserClient::MakeBrowser(int arg)
-{
-  CefWindowInfo window_info;
-  CefRefPtr<CefBrowser> browser;
-  CefBrowserSettings browser_settings;
+/** Browser App methods */
 
-  window_info.SetAsWindowless(0);
-  browser = CefBrowserHost::CreateBrowserSync(window_info, this, std::string(mElement->url), browser_settings, nullptr, nullptr);
-  g_mutex_lock (&init_lock);
-  g_assert (browsers < G_MAXUINT64);
-  browsers += 1;
-  g_mutex_unlock(&init_lock);
-
-  browser->GetHost()->SetAudioMuted(true);
-
-  mElement->browser = browser;
-
-  g_mutex_lock (&mElement->state_lock);
-  mElement->started = TRUE;
-  g_cond_signal (&mElement->state_cond);
-  g_mutex_unlock(&mElement->state_lock);
-}
-
-App::App(GstCefSrc *src) : src(src)
+BrowserApp::BrowserApp(GstCefSrc *src) : src(src)
 {
 }
 
-CefRefPtr<CefBrowserProcessHandler> App::GetBrowserProcessHandler()
+CefRefPtr<CefBrowserProcessHandler> BrowserApp::GetBrowserProcessHandler()
 {
   return this;
 }
 
 #ifdef __APPLE__
-void App::OnScheduleMessagePumpWork(int64_t delay_ms)
+void BrowserApp::OnScheduleMessagePumpWork(int64_t delay_ms)
 {
   static const int64_t kMaxTimerDelay = 1000.0 / 60.0;
 
@@ -453,8 +585,8 @@ void App::OnScheduleMessagePumpWork(int64_t delay_ms)
 }
 #endif
 
-void App::OnBeforeCommandLineProcessing(const CefString &process_type,
-                                             CefRefPtr<CefCommandLine> command_line)
+void BrowserApp::OnBeforeCommandLineProcessing(const CefString &process_type,
+                                               CefRefPtr<CefCommandLine> command_line)
 {
     command_line->AppendSwitchWithValue("autoplay-policy", "no-user-gesture-required");
     command_line->AppendSwitch("enable-media-stream");
@@ -500,6 +632,9 @@ void App::OnBeforeCommandLineProcessing(const CefString &process_type,
       g_strfreev (flags_list);
     }
 }
+
+
+/** cefsrc (Gstreamer) methods */
 
 static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
 {
@@ -566,7 +701,7 @@ run_cef (GstCefSrc *src)
 #endif
 
   CefSettings settings;
-  CefRefPtr<App> app;
+  CefRefPtr<BrowserApp> app;
   CefWindowInfo window_info;
   CefBrowserSettings browserSettings;
 
@@ -646,7 +781,7 @@ run_cef (GstCefSrc *src)
   g_free(base_path);
   g_free(locales_dir_path);
 
-  app = new App(src);
+  app = new BrowserApp(src);
 
   if (!CefInitialize(args, settings, app, nullptr)) {
     GST_ERROR ("Failed to initialize CEF");
@@ -661,10 +796,11 @@ run_cef (GstCefSrc *src)
   }
 
   g_mutex_lock (&init_lock);
-  cef_status = CEF_STATUS_INITIALIZED;
+  cef_status = src->listen_for_js_signals
+    ? CEF_STATUS_WAITING_FOR_READY_SIGNAL
+    : CEF_STATUS_INITIALIZED;
   g_cond_broadcast (&init_cond);
   g_mutex_unlock (&init_lock);
-
 #ifndef __APPLE__
   CefRunMessageLoop();
   gst_cef_shutdown(nullptr);
@@ -675,7 +811,7 @@ done:
 }
 
 static GstStateChangeReturn
-gst_cef_src_change_state(GstElement *element, GstStateChange transition)
+gst_cef_src_change_state(GstElement *src, GstStateChange transition)
 {
   GstStateChangeReturn result = GST_STATE_CHANGE_SUCCESS;
 
@@ -697,20 +833,20 @@ gst_cef_src_change_state(GstElement *element, GstStateChange transition)
       /* in the main thread as per Cocoa */
       if (pthread_main_np()) {
         g_mutex_unlock (&init_lock);
-        run_cef ((GstCefSrc*) element);
+        run_cef ((GstCefSrc*) src);
         g_mutex_lock (&init_lock);
       } else {
-        dispatch_async_f(dispatch_get_main_queue(), (GstCefSrc*)element, (dispatch_function_t)&run_cef);
+        dispatch_async_f(dispatch_get_main_queue(), (GstCefSrc*)src, (dispatch_function_t)&run_cef);
         while (cef_status == CEF_STATUS_INITIALIZING)
           g_cond_wait (&init_cond, &init_lock);
       }
 #else
         /* in a separate UI thread */
-      thread = g_thread_new("cef-ui-thread", (GThreadFunc) run_cef, (GstCefSrc*)element);
+      thread = g_thread_new("cef-ui-thread", (GThreadFunc) run_cef, (GstCefSrc*)src);
       while (cef_status == CEF_STATUS_INITIALIZING)
         g_cond_wait (&init_cond, &init_lock);
 #endif
-      if (cef_status != CEF_STATUS_INITIALIZED) {
+      if (cef_status & ~CEF_STATUS_MASK_INITIALIZED) {
         // BAIL OUT, CEF is not loaded.
         result = GST_STATE_CHANGE_FAILURE;
 #ifndef __APPLE__
@@ -738,7 +874,7 @@ gst_cef_src_change_state(GstElement *element, GstStateChange transition)
         gst_cef_shutdown (nullptr);
         g_mutex_lock (&init_lock);
       } else {
-        dispatch_async_f(dispatch_get_main_queue(), (GstCefSrc*)element, (dispatch_function_t)&gst_cef_shutdown);
+        dispatch_async_f(dispatch_get_main_queue(), (GstCefSrc*)src, (dispatch_function_t)&gst_cef_shutdown);
         while (cef_status == CEF_STATUS_SHUTTING_DOWN)
           g_cond_wait (&init_cond, &init_lock);
       }
@@ -759,7 +895,7 @@ gst_cef_src_change_state(GstElement *element, GstStateChange transition)
   }
 
   if (result == GST_STATE_CHANGE_FAILURE) return result;
-  result = GST_ELEMENT_CLASS(parent_class)->change_state(element, transition);
+  result = GST_ELEMENT_CLASS(parent_class)->change_state(src, transition);
 
   return result;
 }
@@ -769,11 +905,7 @@ gst_cef_src_start(GstBaseSrc *base_src)
 {
   gboolean ret = FALSE;
   GstCefSrc *src = GST_CEF_SRC (base_src);
-  CefRefPtr<BrowserClient> browserClient;
-  CefRefPtr<RenderHandler> renderHandler = new RenderHandler(src);
-  CefRefPtr<AudioHandler> audioHandler = new AudioHandler(src);
-  CefRefPtr<RequestHandler> requestHandler = new RequestHandler(src);
-  CefRefPtr<DisplayHandler> displayHandler = new DisplayHandler(src);
+  CefRefPtr<BrowserClient> browserClient = new BrowserClient(src);
 
   /* Make sure CEF is initialized before posting a task */
   g_mutex_lock (&init_lock);
@@ -787,8 +919,6 @@ gst_cef_src_start(GstBaseSrc *base_src)
   GST_OBJECT_LOCK (src);
   src->n_frames = 0;
   GST_OBJECT_UNLOCK (src);
-
-  browserClient = new BrowserClient(renderHandler, audioHandler, requestHandler, displayHandler, src);
 #ifdef __APPLE__
   if (pthread_main_np()) {
     /* in the main thread as per Cocoa */
@@ -805,6 +935,13 @@ gst_cef_src_start(GstBaseSrc *base_src)
 #ifdef __APPLE__
   }
 #endif
+
+  if (src->listen_for_js_signals) {
+    g_mutex_lock (&init_lock);
+    while (cef_status == CEF_STATUS_WAITING_FOR_READY_SIGNAL)
+      g_cond_wait (&init_cond, &init_lock);
+    g_mutex_unlock (&init_lock);
+  }
 
   ret = src->browser != NULL;
 
@@ -973,6 +1110,11 @@ gst_cef_src_set_property (GObject * object, guint prop_id, const GValue * value,
       src->sandbox = g_value_get_boolean (value);
       break;
     }
+    case PROP_LISTEN_FOR_JS_SIGNAL:
+    {
+      src->listen_for_js_signals = g_value_get_boolean (value);
+      break;
+    }
     case PROP_JS_FLAGS: {
       g_free (src->js_flags);
       src->js_flags = g_value_dup_string (value);
@@ -1014,6 +1156,9 @@ gst_cef_src_get_property (GObject * object, guint prop_id, GValue * value,
       break;
     case PROP_SANDBOX:
       g_value_set_boolean (value, src->sandbox);
+      break;
+    case PROP_LISTEN_FOR_JS_SIGNAL:
+      g_value_set_boolean (value, src->listen_for_js_signals);
       break;
     case PROP_JS_FLAGS:
       g_value_set_string (value, src->js_flags);
@@ -1062,6 +1207,7 @@ gst_cef_src_init (GstCefSrc * src)
   src->started = FALSE;
   src->chromium_debug_port = DEFAULT_CHROMIUM_DEBUG_PORT;
   src->sandbox = DEFAULT_SANDBOX;
+  src->listen_for_js_signals = DEFAULT_LISTEN_FOR_JS_SIGNALS;
   src->js_flags = NULL;
   src->log_severity = DEFAULT_LOG_SEVERITY;
   src->cef_cache_location = NULL;
@@ -1111,6 +1257,10 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
     g_param_spec_boolean ("sandbox", "sandbox",
           "Toggle chromium sandboxing capabilities",
           DEFAULT_SANDBOX, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
+  g_object_class_install_property (gobject_class, PROP_LISTEN_FOR_JS_SIGNAL,
+    g_param_spec_boolean ("listen-for-js-signals", "listen-for-js-signals",
+          "Listen and respond to signals sent from javascript: window.gstSendMsg({request: \"ready|eos\", ...})",
+          DEFAULT_LISTEN_FOR_JS_SIGNALS, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
 
   g_object_class_install_property (gobject_class, PROP_JS_FLAGS,
     g_param_spec_string ("js-flags", "js-flags",
@@ -1132,7 +1282,8 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
 
   gst_element_class_set_static_metadata (gstelement_class,
       "Chromium Embedded Framework source", "Source/Video",
-      "Creates a video stream from an embedded Chromium browser", "Mathieu Duponchelle <mathieu@centricular.com>");
+      "Creates a video stream from an embedded Chromium browser",
+      "Mathieu Duponchelle <mathieu@centricular.com>");
 
   gst_element_class_add_static_pad_template (gstelement_class,
       &gst_cef_src_template);
