@@ -818,7 +818,7 @@ done:
 static GstStateChangeReturn
 gst_cef_src_change_state(GstElement *src, GstStateChange transition)
 {
-  GstStateChangeReturn result = GST_STATE_CHANGE_SUCCESS;
+  auto result = GST_CALL_PARENT_WITH_DEFAULT (GST_ELEMENT_CLASS , change_state, (src, transition), GST_STATE_CHANGE_FAILURE);
 
   switch(transition)
   {
@@ -874,20 +874,13 @@ gst_cef_src_change_state(GstElement *src, GstStateChange transition)
       cef_status = CEF_STATUS_SHUTTING_DOWN;
 #ifdef __APPLE__
       /* in the main thread as per Cocoa */
-      if (pthread_main_np()) {
-        g_mutex_unlock (&init_lock);
-        gst_cef_shutdown (nullptr);
-        g_mutex_lock (&init_lock);
-      } else {
-        dispatch_async_f(dispatch_get_main_queue(), (GstCefSrc*)src, (dispatch_function_t)&gst_cef_shutdown);
-        while (cef_status == CEF_STATUS_SHUTTING_DOWN)
-          g_cond_wait (&init_cond, &init_lock);
-      }
-#else
+      dispatch_async_f(dispatch_get_main_queue(), nullptr, (dispatch_function_t)&gst_cef_shutdown);
+#endif
       // the UI thread handles it through the message loop return,
       // this MUST NOT let GStreamer conduct unwind ops until CEF is truly dead
       while (cef_status == CEF_STATUS_SHUTTING_DOWN)
         g_cond_wait (&init_cond, &init_lock);
+#ifndef __APPLE__
       g_thread_join(thread);
       thread = nullptr;
 #endif
@@ -931,26 +924,13 @@ gst_cef_src_start(GstBaseSrc *base_src)
   src->n_frames = 0;
   GST_OBJECT_UNLOCK (src);
 
-  GST_ELEMENT_PROGRESS(src, CONTINUE, "open", ("Creating CEF browser (#%lu)...", browser_id));
+  CefPostTask(TID_UI, base::BindOnce(&BrowserClient::MakeBrowser, browserClient.get(), 0));
 
-#ifdef __APPLE__
-  if (pthread_main_np()) {
-    /* in the main thread as per Cocoa */
-    browserClient->MakeBrowser(0);
-  } else {
-#endif
-    CefPostTask(TID_UI, base::BindOnce(&BrowserClient::MakeBrowser, browserClient.get(), 0));
-
-    /* And wait for this src's browser to have been created */
-    GST_ELEMENT_PROGRESS(src, CONTINUE, "open", ("Waiting for CEF browser initialization..."));
-
-    g_mutex_lock(&src->state_lock);
-    while (!CefSrcStateIsOpen(src->state))
-      g_cond_wait (&src->state_cond, &src->state_lock);
-    g_mutex_unlock (&src->state_lock);
-#ifdef __APPLE__
-  }
-#endif
+  /* And wait for this src's browser to have been created */
+  g_mutex_lock(&src->state_lock);
+  while (!CefSrcStateIsOpen(src->state))
+    g_cond_wait (&src->state_cond, &src->state_lock);
+  g_mutex_unlock (&src->state_lock);
 
 
   if (src->listen_for_js_signals) {
@@ -993,17 +973,11 @@ gst_cef_src_stop (GstBaseSrc *base_src)
 
   if (src->browser) {
     gst_cef_src_close_browser(src);
-#ifdef __APPLE__
-    if (!pthread_main_np()) {
-#endif
-      /* And wait for this src's browser to have been closed */
-      g_mutex_lock(&src->state_lock);
-      while (CefSrcStateIsOpen(src->state))
-        g_cond_wait (&src->state_cond, &src->state_lock);
-      g_mutex_unlock (&src->state_lock);
-#ifdef __APPLE__
-    }
-#endif
+    /* And wait for this src's browser to have been closed */
+    g_mutex_lock(&src->state_lock);
+    while (CefSrcStateIsOpen(src->state))
+      g_cond_wait (&src->state_cond, &src->state_lock);
+    g_mutex_unlock (&src->state_lock);
   }
 
   gst_buffer_replace (&src->current_buffer, NULL);
